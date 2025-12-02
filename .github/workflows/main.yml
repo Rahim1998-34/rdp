@@ -1,0 +1,89 @@
+name: RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 1440  # 24 hours
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          # Disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Add firewall rule if missing
+          $rule = Get-NetFirewallRule -DisplayName "RDP-Tailscale" -ErrorAction SilentlyContinue
+          if (-not $rule) {
+              New-NetFirewallRule -DisplayName "RDP-Tailscale" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow
+          }
+
+          # Restart Remote Desktop service once
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          # Generate a strong 16-character password
+          $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+'
+          $password = -join ((1..16) | ForEach-Object { $chars | Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create user if not exists and assign groups
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          }
+
+          # Mask password in logs and set environment variable
+          echo "::add-mask::$password"
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          # Install latest Tailscale via winget
+          winget install --id Tailscale.Tailscale --silent
+
+      - name: Establish Tailscale Connection
+        run: |
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for Tailscale IP
+          $timeout=60
+          $elapsed=0
+          $tsIP=$null
+          while (-not $tsIP -and $elapsed -lt $timeout) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $elapsed += 5
+          }
+          if (-not $tsIP) { throw "Tailscale IP not assigned" }
+
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Verify RDP Accessibility
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              throw "TCP connection to RDP port 3389 failed"
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Keep Runner Alive 24h
+        run: |
+          $endTime = (Get-Date).AddHours(24)
+          Write-Host "RDP setup complete. Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP | Password: $(echo $env:RDP_CREDS)"
+          while ((Get-Date) -lt $endTime) {
+              Start-Sleep -Seconds 3600  # sleep 1 hour per iteration
+          }
